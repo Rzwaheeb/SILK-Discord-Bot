@@ -12,3 +12,4 @@ motor
 certifi
 quart
 psutil
+cachetools

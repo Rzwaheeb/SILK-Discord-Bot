@@ -19,7 +19,11 @@ import contextlib
 import logging
 import os
 import re
+import time
 import traceback
+import uuid
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import Any, Final
 
@@ -80,6 +84,7 @@ class _EmptyGenerationError(RuntimeError):
     def __init__(self, finish_reason: Any, detail: str) -> None:
         super().__init__(detail)
         self.finish_reason = finish_reason
+        self.outcome: _RagOutcome | None = None
 
 
 # ─────────────────────────────────────────────
@@ -91,6 +96,19 @@ class _SearchConfidence(Enum):
     HIGH = auto()    # score >= HIGH_THRESHOLD → answer normally
     LOOSE = auto()   # LOW_THRESHOLD <= score < HIGH_THRESHOLD → answer with disclaimer
     NONE = auto()    # score < LOW_THRESHOLD → no results
+
+
+@dataclass
+class _RagOutcome:
+    """Internal result object used for logging and cache metadata."""
+    answer: str
+    confidence: _SearchConfidence | None = None
+    documents: list[dict[str, Any]] = field(default_factory=list)
+    top_score: float | None = None
+    cache_hit: bool = False
+    error: str | None = None
+    latency: dict[str, float] = field(default_factory=dict)
+    log_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
 # ─────────────────────────────────────────────
@@ -129,6 +147,18 @@ class AoTRGPT(commands.Cog):
 
     CACHE_MAX_SIZE: Final[int] = 500
     CACHE_TTL_SECONDS: Final[int] = 3600
+
+    _LOG_FIELD_HINTS: Final[tuple[str, ...]] = (
+        "name",
+        "title",
+        "item",
+        "entity",
+        "npc",
+        "quest",
+        "key",
+        "slug",
+        "id",
+    )
 
     # ── Prompt Engineering ───────────────────────────────────────────────
     SYSTEM_INSTRUCTION: Final[str] = (
@@ -208,7 +238,7 @@ class AoTRGPT(commands.Cog):
         # Concurrency & caching
         self._locks = _KeyedLocks()
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_AI_CALLS)
-        self._cache: cachetools.TTLCache[str, str] = cachetools.TTLCache(
+        self._cache: cachetools.TTLCache[str, _RagOutcome] = cachetools.TTLCache(
             maxsize=self.CACHE_MAX_SIZE, ttl=self.CACHE_TTL_SECONDS
         )
 
@@ -243,54 +273,132 @@ class AoTRGPT(commands.Cog):
             return await ctx.reply("⏳ You already have a request running. Please wait!", mention_author=False)
 
         # --- Main RAG pipeline ---
+        outcome: _RagOutcome | None = None
+
         async with self._locks.acquire(ctx.author.id), ctx.typing():
             try:
-                answer = await asyncio.wait_for(
+                outcome = await asyncio.wait_for(
                     self._rag_pipeline(prompt), timeout=self.REQUEST_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
                 logger.warning("Timeout | user=%s (%s)", ctx.author, ctx.author.id)
+                self._dispatch_ai_log(
+                    ctx,
+                    prompt,
+                    _RagOutcome(answer=self.TIMEOUT_MSG, error="timeout"),
+                )
                 return await ctx.reply(self.TIMEOUT_MSG, mention_author=False)
             except _EmptyGenerationError as exc:
                 logger.warning("Empty generation | user=%s | reason=%s", ctx.author.id, exc.finish_reason)
-                return await ctx.reply(self._empty_gen_message(exc.finish_reason), mention_author=False)
+                answer = self._empty_gen_message(exc.finish_reason)
+
+                partial = exc.outcome if exc.outcome is not None else _RagOutcome(answer=answer)
+                partial.answer = answer
+                partial.error = f"empty_generation:{exc.finish_reason}"
+
+                self._dispatch_ai_log(ctx, prompt, partial)
+                return await ctx.reply(answer, mention_author=False)
             except Exception as exc:
+                self._dispatch_ai_log(
+                    ctx,
+                    prompt,
+                    _RagOutcome(
+                        answer=self.GENERIC_FAILURE_MSG,
+                        error=f"{type(exc).__name__}: {exc}",
+                    ),
+                )
                 return await self._reply_failure(ctx, "!info", exc)
 
-        await self._send_layout_reply(ctx, answer)
+        if outcome is None:
+            return
+
+        await self._send_layout_reply(ctx, outcome.answer)
+        self._dispatch_ai_log(ctx, prompt, outcome)
 
     # ── RAG Pipeline (core logic) ────────────────────────────────────────
 
-    async def _rag_pipeline(self, prompt: str) -> str:
+    async def _rag_pipeline(self, prompt: str) -> _RagOutcome:
         """Embed → Search → Generate, with TTL-cache short-circuit and tiered confidence."""
         cache_key = prompt.lower()
 
-        # Cache hit: zero API cost
-        if (cached := self._cache.get(cache_key)) is not None:
-            return cached
+        # Cache hit: zero API cost, but still return retrieval metadata.
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            if isinstance(cached, _RagOutcome):
+                return replace(
+                    cached,
+                    cache_hit=True,
+                    log_id=uuid.uuid4().hex[:12],
+                    latency={},
+                )
+
+            # Safety fallback in case an old string cache value somehow exists.
+            return _RagOutcome(answer=str(cached), cache_hit=True)
+
+        total_start = time.perf_counter()
+        latency: dict[str, float] = {}
 
         # Step 1: Embed query
         async with self._semaphore:
+            embed_start = time.perf_counter()
             query_vector = await self._embed(prompt)
+            latency["embed_ms"] = round((time.perf_counter() - embed_start) * 1000, 2)
 
         # Step 2: Vector search with confidence tiering
+        search_start = time.perf_counter()
         documents, confidence = await self._vector_search(query_vector)
+        latency["search_ms"] = round((time.perf_counter() - search_start) * 1000, 2)
+
+        docs_log = self._documents_for_log(documents)
+        top_score = docs_log[0]["score"] if docs_log else None
 
         if confidence is _SearchConfidence.NONE:
-            return self.NO_RESULTS_MSG
+            latency["total_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
+            return _RagOutcome(
+                answer=self.NO_RESULTS_MSG,
+                confidence=confidence,
+                documents=docs_log,
+                top_score=top_score,
+                latency=latency,
+            )
 
         # Step 3: Generate grounded answer
         context = self._format_documents(documents)
         full_prompt = self._build_grounded_prompt(prompt, context)
-        async with self._semaphore:
-            answer = await self._generate(full_prompt, self.SYSTEM_INSTRUCTION)
+
+        try:
+            async with self._semaphore:
+                gen_start = time.perf_counter()
+                answer = await self._generate(full_prompt, self.SYSTEM_INSTRUCTION)
+                latency["generate_ms"] = round((time.perf_counter() - gen_start) * 1000, 2)
+        except _EmptyGenerationError as exc:
+            latency["total_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
+            exc.outcome = _RagOutcome(
+                answer=self.EMPTY_RESPONSE_MSG,
+                confidence=confidence,
+                documents=docs_log,
+                top_score=top_score,
+                latency=latency,
+            )
+            raise
 
         # Step 4: Prepend disclaimer for loose matches
         if confidence is _SearchConfidence.LOOSE:
             answer = self.LOOSE_MATCH_DISCLAIMER + answer
 
-        self._cache[cache_key] = answer
-        return answer
+        latency["total_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
+
+        outcome = _RagOutcome(
+            answer=answer,
+            confidence=confidence,
+            documents=docs_log,
+            top_score=top_score,
+            cache_hit=False,
+            latency=latency,
+        )
+
+        self._cache[cache_key] = outcome
+        return outcome
 
     # ── Gemini: Embedding ────────────────────────────────────────────────
 
@@ -347,7 +455,7 @@ class AoTRGPT(commands.Cog):
                 top_score, self.VECTOR_SEARCH_HIGH_THRESHOLD,
             )
             return docs, _SearchConfidence.LOOSE
-        return [], _SearchConfidence.NONE
+        return docs, _SearchConfidence.NONE
 
     # ── Gemini: Generation ───────────────────────────────────────────────
 
@@ -565,6 +673,100 @@ class AoTRGPT(commands.Cog):
         """Catch unregistered commands globally."""
         if isinstance(error, commands.CommandNotFound):
             await ctx.reply("❌ Unknown command! Try `!info <question>`.", mention_author=False)
+
+    # ── Logging Helpers ────────────────────────────────────────────────
+    def _documents_for_log(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Create compact, safe document summaries for Discord logging."""
+        result: list[dict[str, Any]] = []
+
+        for idx, doc in enumerate(documents, 1):
+            fields = {
+                k: v
+                for k, v in doc.items()
+                if k not in ("embedding", "score")
+            }
+
+            doc_id = str(fields.get("_id", "")) if "_id" in fields else ""
+            score = doc.get("score")
+
+            name = None
+            for hint in self._LOG_FIELD_HINTS:
+                value = fields.get(hint)
+                if value is not None and str(value).strip():
+                    name = str(value)[:120]
+                    break
+
+            if not name and doc_id:
+                name = doc_id
+
+            result.append(
+                {
+                    "rank": idx,
+                    "id": doc_id,
+                    "score": round(float(score), 4) if isinstance(score, (int, float)) else None,
+                    "name": name,
+                    "snippet": self._compact_fields_for_log(fields),
+                }
+            )
+
+        return result
+
+    def _compact_fields_for_log(self, fields: dict[str, Any], limit: int = 500) -> str:
+        """Serialize document fields into a short readable snippet."""
+        parts: list[str] = []
+
+        for key, value in fields.items():
+            if key == "_id":
+                continue
+
+            if isinstance(value, (str, int, float, bool)):
+                text_value = str(value)
+            else:
+                text_value = repr(value)
+
+            text_value = text_value.replace("\n", " ")
+
+            if len(text_value) > 180:
+                text_value = text_value[:177] + "..."
+
+            parts.append(f"{key}={text_value}")
+
+        text = " | ".join(parts)
+        return text[:limit]
+
+    def _dispatch_ai_log(
+        self,
+        ctx: commands.Context,
+        prompt: str,
+        outcome: _RagOutcome,
+    ) -> None:
+        """Dispatch log payload to a separate logger cog, without blocking the user response."""
+        try:
+            payload = {
+                "log_id": outcome.log_id,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "source": "aotr_gpt",
+                "guild_id": ctx.guild.id if ctx.guild else None,
+                "guild_name": ctx.guild.name if ctx.guild else "DM",
+                "channel_id": ctx.channel.id if ctx.channel else None,
+                "channel_name": getattr(ctx.channel, "name", "DM"),
+                "user_id": ctx.author.id,
+                "user_name": str(ctx.author),
+                "query": prompt,
+                "answer": outcome.answer,
+                "cache_hit": outcome.cache_hit,
+                "confidence": outcome.confidence.name if outcome.confidence else None,
+                "top_score": outcome.top_score,
+                "high_threshold": self.VECTOR_SEARCH_HIGH_THRESHOLD,
+                "low_threshold": self.VECTOR_SEARCH_LOW_THRESHOLD,
+                "latency": outcome.latency,
+                "documents": outcome.documents,
+                "error": outcome.error,
+            }
+
+            self.bot.dispatch("aotr_gpt_log", payload)
+        except Exception:
+            logger.exception("Failed to dispatch AoTR AI log payload.")
 
     # ── Utility Helpers ──────────────────────────────────────────────────
 
